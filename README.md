@@ -1,7 +1,3 @@
-<img width="1919" height="1079" alt="Screenshot 2026-09-20 072331" src="https://github.com/user-attachments/assets/3fb5c70e-8c9f-4214-91e8-0824823ae20b" />
-<img width="1919" height="1079" alt="Screenshot 2026-09-20 064125" src="https://github.com/user-attachments/assets/c2b1bdf2-e358-46b1-95f2-1968f38df5eb" />
-
-
 # Codera HUD
 
 **Codera HUD** (`codera-hud`) is a QBCore / ESX / Qbox compatible HUD resource for FiveM.
@@ -12,6 +8,7 @@ It replaces the native GTA HUD with a single, fully client-side package that inc
 - Circular minimap with compass, heading, street/zone name and waypoint distance
 - A personal `/hudsettings` menu where every player can move, resize, hide and configure
   the HUD to their own taste — saved locally, no database required
+- A built-in chat box styled to match the rest of the HUD
 
 ## Table of contents
 
@@ -19,12 +16,12 @@ It replaces the native GTA HUD with a single, fully client-side package that inc
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Chat box](#chat-box)
 - [Voice integration (pma-voice / qb-voice)](#voice-integration-pma-voice--qb-voice)
 - [Framework integration](#framework-integration)
 - [Seatbelt integration (qb-smallresources)](#seatbelt-integration-qb-smallresources)
 - [Vehicle lock integration (qb-vehiclekeys)](#vehicle-lock-integration-qb-vehiclekeys)
 - [Minimap calibration](#minimap-calibration)
-- [Minimap zoom](#minimap-zoom)
 - [HUD settings menu (/hudsettings)](#hud-settings-menu-hudsettings)
 - [Troubleshooting](#troubleshooting)
 - [Resource layout](#resource-layout)
@@ -47,6 +44,8 @@ It replaces the native GTA HUD with a single, fully client-side package that inc
 - Cinematic mode command
 - `/hudsettings` personal menu: drag and resize every element, hide the parts you
   don't want, pick MPH/KM/H and adjust the overall HUD opacity — saved per player
+- A chat box that matches the HUD's look: press `T` to type, messages stack above
+  the input and fade out automatically after a few seconds
 
 ## Requirements
 
@@ -87,16 +86,6 @@ Resource names can be remapped through `Config.FrameworkResources` and
    ```
 
    `qb-smallresources`, `qb-vehiclekeys` and the voice resource are all optional —
-   omit any of them your server doesn't use.
-4. Disable any other HUD or minimap resource so the two don't draw over each other.
-5. Restart the server, or restart resources in dependency order:
-
-   ```text
-   restart qb-smallresources
-   restart codera-hud
-   ```
-6. In the GTA display settings, set **Safezone Size** all the way to the right.
-   The HUD shows an on-screen calibration warning if the value is too low.
 
 ## Configuration
 
@@ -171,16 +160,6 @@ Config.UseCustomCrosshair = true
 
 Set to `false` to keep GTA's default aiming reticle instead.
 
-### Minimap zoom defaults
-
-```lua
-Config.MapZoom     = 0     -- 0 = game default
-Config.MapZoomStep = 100
-Config.MapZoomMin  = 300
-Config.MapZoomMax  = 1400
-```
-
-A player's own zoom choice (set with `/vhudzoom`) is saved and overrides this default.
 
 ### Settings menu branding
 
@@ -189,6 +168,75 @@ Config.SettingsBrand = 'CODERA HUD'
 ```
 
 Text shown in the footer of the `/hudsettings` menu ("`<name>` / Personal settings").
+
+## Chat box
+
+Codera HUD ships its own chat box, styled like the rest of the HUD (same dark
+pill as the health/armor bars). It sits in the same spot as the microphone
+badge — the badge hides and the chat pill takes its place whenever the box is
+open or a message is still on screen, then the badge returns once everything
+has faded out.
+
+**This replaces the default `chat` resource** (unless you set
+`Config.Chat.enabled = false`, see below). Remove or comment out `chat`
+(and `chat-theme-*` if you have one) from `server.cfg`, otherwise two chat
+boxes will draw on top of each other:
+
+```cfg
+# ensure chat        <- remove or comment this out
+ensure codera-hud
+```
+
+
+
+```lua
+Config.Chat = {
+    enabled = false,
+    -- ... the other values are ignored while disabled
+}
+```
+
+### Configuration
+
+```lua
+Config.Chat = {
+    enabled = true,        -- true = built-in chat, false = use your own chat resource
+    key = 'T',             -- keyboard key that opens the chat box
+    maxLength = 120,        -- max characters per message
+    maxHistory = 50,        -- messages kept in memory
+    visibleWhenClosed = 6,  -- recent messages shown once the box is closed
+    fadeAfter = 8000,       -- ms before a message starts fading out
+    fadeDuration = 400,     -- ms of the fade-out transition
+    inputWidth = 340         -- px width of the chat input pill
+}
+```
+
+### Compatibility with other resources
+
+The author name is always resolved server-side from `GetPlayerName()` (never
+trusted from the client), and every message still passes through the standard
+`chatMessage` server event before being broadcast — any resource that already
+hooks `chatMessage` to filter, log or cancel messages (profanity filters,
+OOC/IC formatting, admin logging, etc.) keeps working unchanged:
+
+```lua
+AddEventHandler('chatMessage', function(source, author, message)
+    -- return false / CancelEvent() here to block a message, same as before
+end)
+```
+
+Resources that broadcast system/admin messages using the default chat
+resource's client event also still show up correctly, since Codera HUD listens
+for the same event names:
+
+```lua
+TriggerClientEvent('chat:addMessage', -1, { args = { '[ANNOUNCEMENT]', 'Server restarting in 5 minutes' } })
+TriggerClientEvent('chat:clear', -1)
+```
+
+Note: resources that call `exports['chat']:addMessage(...)` directly (rather
+than triggering the event above) target the `chat` resource by name and won't
+reach Codera HUD's chat unless you adapt them to use the event instead.
 
 ## Voice integration (pma-voice / qb-voice)
 
@@ -273,18 +321,6 @@ If the map isn't centered inside the compass ring, run `/vhudmap` in-game:
 - `/vhudmap debug` — print resolution, safezone and alignment values (F8 console
   and on-screen for 20 seconds)
 
-## Minimap zoom
-
-```text
-/vhudzoom in
-/vhudzoom out
-/vhudzoom <300-1400>
-/vhudzoom reset
-```
-
-Default keys are `=` (zoom in) and `-` (zoom out) — rebind them under FiveM key
-bindings if needed. A higher number shows more of the map. Each player's choice is
-saved locally; the server-wide default is `Config.MapZoom`.
 
 ## HUD settings menu (/hudsettings)
 
@@ -312,42 +348,3 @@ any database.
 The native GTA minimap always follows the compass ring; while dragging the compass
 in the layout editor, the map catches up as soon as you release it.
 
-## Troubleshooting
-
-| Symptom | Fix |
-| --- | --- |
-| Native GTA health/armor bars show under the minimap | Restart `codera-hud` — it suppresses those scaleform elements every frame. |
-| Seatbelt icon doesn't change | Restart `qb-smallresources` **before** `codera-hud`, then check the `toggleseatbelt` keybind. |
-| Vehicle lock icon doesn't change | Confirm your vehicle-key resource updates the native door-lock state (stock `qb-vehiclekeys` does). |
-| Voice icon stuck / radio state never activates | Make sure `pma-voice` or `qb-voice` is started **before** `codera-hud`, and that `Config.VoiceResource` matches what you run (or leave it on `'auto'`). |
-| HUD elements are misaligned | Set GTA's Safezone Size to maximum in display settings. |
-| Duplicate HUD elements appear | Stop any other HUD/minimap resource running alongside this one. |
-
-## Resource layout
-
-```text
-codera-hud/
-|-- client/
-|   |-- main.lua       -- framework bridge, shared state, cinematic mode, voice detection
-|   |-- settings.lua   -- /hudsettings menu, persisted KVP settings
-|   |-- player.lua     -- health/armor/needs/voice/stamina/weapon data
-|   |-- vehicle.lua    -- vehicle HUD data
-|   |-- minimap.lua    -- circular minimap, compass, calibration
-|   `-- zoom.lua       -- minimap zoom (/vhudzoom)
-|-- server/
-|   `-- main.lua       -- startup checks and console warnings
-|-- stream/
-|   `-- circlemap_codera.ytd
-|-- audiodirectory/
-|   `-- seatbelt_sounds.awc
-|-- data/
-|   `-- seatbelt_sounds.dat54.rel
-|-- web/
-|   |-- css/
-|   |-- fonts/
-|   |-- js/
-|   `-- index.html
-|-- config.lua
-|-- fxmanifest.lua
-`-- README.md
-```
