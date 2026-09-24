@@ -1,16 +1,53 @@
 
 local TXD = 'circlemap_codera'
-local KVP_KEY = 'codera_hud:minimap2'
+local KVP_KEY = 'codera_hud:minimap3'      -- calibration per aspect ratio (new format)
+local OLD_KVP_KEY = 'codera_hud:minimap2'  -- old format: fixed screen fractions, see below
 
 
 local RING = { left = 0.845, top = 0.10, diameter = 0.105 }
 
-
-local DEFAULT_TUNE = { x = -0.031, y = 0.016, scale = 0.591, stretch = 0.882 }
+-- Calibration values are stored as FRACTIONS OF THE RING DIAMETER, not as fixed
+-- fractions of the screen. GTA's minimap error (the map sitting off-centre in
+-- the ring) grows and shrinks together with the size of the ring, so an offset
+-- that is a fraction of the ring stays correct at any resolution and at any HUD
+-- size chosen in /hudsettings. (The old code used fixed screen fractions, which
+-- only lined up at the one resolution / HUD scale it was tuned on.)
+--   x / y   -> offset, in ring diameters (x: right = +, y: down = +)
+--   scale   -> size of the map circle relative to the ring
+--   stretch -> width correction so the circle is round
+local DEFAULT_TUNE = { x = -0.2952, y = 0.0857, scale = 0.591, stretch = 0.882 }
 local Tune = {
     x = DEFAULT_TUNE.x, y = DEFAULT_TUNE.y,
     scale = DEFAULT_TUNE.scale, stretch = DEFAULT_TUNE.stretch
 }
+
+-- Measured defaults. 16:9 = the original calibration, 16:10 = measured in-game at
+-- 1440x900. Aspect ratios in between are interpolated, anything wider than 16:9
+-- uses the 16:9 values, anything narrower than 16:10 (4:3, 5:4) uses the 16:10
+-- values until the player runs /vhudmap once.
+local WIDE   = { aspect = 16 / 9, x = DEFAULT_TUNE.x, y = DEFAULT_TUNE.y }
+local NARROW = { aspect = 1.6,    x = -1.1095,        y = 0.3190 }
+
+local function defaultFor(aspect)
+    local x, y
+    if aspect >= WIDE.aspect then
+        x, y = WIDE.x, WIDE.y
+    elseif aspect <= NARROW.aspect then
+        x, y = NARROW.x, NARROW.y
+    else
+        local t = (aspect - NARROW.aspect) / (WIDE.aspect - NARROW.aspect)
+        x = NARROW.x + ((WIDE.x - NARROW.x) * t)
+        y = NARROW.y + ((WIDE.y - NARROW.y) * t)
+    end
+    return { x = x, y = y, scale = DEFAULT_TUNE.scale, stretch = DEFAULT_TUNE.stretch }
+end
+
+-- Manual calibrations made with /vhudmap, one per aspect ratio (16:9, 16:10,
+-- 21:9 ...). Every resolution with the same aspect ratio shares it, because the
+-- values are relative to the ring size.
+local Saved = {}
+local currentKey = nil
+local calibrating = false
 
 
 local BASE_ASPECT  = 16 / 9
@@ -28,29 +65,57 @@ local STD = {
 local METERS_PER_MILE = 1609.344
 
 
-local function resetTune()
-    Tune.x, Tune.y = DEFAULT_TUNE.x, DEFAULT_TUNE.y
-    Tune.scale, Tune.stretch = DEFAULT_TUNE.scale, DEFAULT_TUNE.stretch
+local function aspectKey(resX, resY)
+    return ('%.2f'):format(resX / resY)
 end
 
-local function loadTune()
+local function copyTune(t)
+    return { x = t.x, y = t.y, scale = t.scale, stretch = t.stretch }
+end
+
+local function loadSaved()
+    -- The old key stored offsets in screen fractions. They can't be converted
+    -- reliably (the resolution they were made at isn't known), and they are the
+    -- reason the map only fitted at one resolution, so they are dropped.
+    if GetResourceKvpString(OLD_KVP_KEY) then DeleteResourceKvp(OLD_KVP_KEY) end
+
     local raw = GetResourceKvpString(KVP_KEY)
     if not raw or raw == '' then return end
 
     local ok, data = pcall(json.decode, raw)
     if not ok or type(data) ~= 'table' then return end
 
-    Tune.x       = tonumber(data.x)       or DEFAULT_TUNE.x
-    Tune.y       = tonumber(data.y)       or DEFAULT_TUNE.y
-    Tune.scale   = tonumber(data.scale)   or DEFAULT_TUNE.scale
-    Tune.stretch = tonumber(data.stretch) or DEFAULT_TUNE.stretch
+    for key, entry in pairs(data) do
+        if type(entry) == 'table' then
+            Saved[tostring(key)] = {
+                x       = tonumber(entry.x)       or DEFAULT_TUNE.x,
+                y       = tonumber(entry.y)       or DEFAULT_TUNE.y,
+                scale   = tonumber(entry.scale)   or DEFAULT_TUNE.scale,
+                stretch = tonumber(entry.stretch) or DEFAULT_TUNE.stretch
+            }
+        end
+    end
 end
 
-local function saveTune()
-    SetResourceKvp(KVP_KEY, json.encode(Tune))
+local function persistSaved()
+    if next(Saved) == nil then
+        DeleteResourceKvp(KVP_KEY)
+    else
+        SetResourceKvp(KVP_KEY, json.encode(Saved))
+    end
 end
 
-loadTune()
+-- Picks the calibration for the current aspect ratio (saved one, else default).
+local function selectTune(resX, resY)
+    local key = aspectKey(resX, resY)
+    local source = Saved[key] or defaultFor(resX / resY)
+    Tune.x, Tune.y = source.x, source.y
+    Tune.scale, Tune.stretch = source.scale, source.stretch
+    currentKey = key
+    return key, Saved[key] ~= nil
+end
+
+loadSaved()
 
 
 local function getAlignment(resX, resY)
@@ -105,9 +170,13 @@ local function applyMinimap()
     local ly = layout and layout.y or 0.0
     local ls = layout and layout.scale or 1.0
 
-    local diameterPx = RING.diameter * resX * Tune.scale * ls
-    local centerX = RING.left + lx + ((RING.diameter / 2.0) * ls) + Tune.x
-    local centerY = RING.top + ly + (((RING.diameter * aspect) / 2.0) * ls) + Tune.y
+    -- Ring diameter in pixels (same size the NUI ring has, incl. /hudsettings scale).
+    local ringPx = RING.diameter * resX * ls
+    local diameterPx = ringPx * Tune.scale
+
+    -- Offsets are in ring diameters -> convert to screen fractions for this resolution.
+    local centerX = RING.left + lx + ((RING.diameter / 2.0) * ls) + (Tune.x * ringPx / resX)
+    local centerY = RING.top + ly + (((RING.diameter * aspect) / 2.0) * ls) + (Tune.y * ringPx / resY)
 
     local hudCX = (centerX - ax) / bx
     local hudCY = (centerY - ay) / by
@@ -143,8 +212,12 @@ end
 local applying = false
 
 local function safeApply()
-    if applying or not textureReady then return end
+    if applying or calibrating or not textureReady then return end
     applying = true
+
+    local resX, resY = GetActiveScreenResolution()
+    if resX > 0 and resY > 0 then selectTune(resX, resY) end
+
     applyMinimap()
     applying = false
 end
@@ -338,8 +411,6 @@ CreateThread(function()
 end)
 
 
-local calibrating = false
-
 local function showHelp(text)
     BeginTextCommandDisplayHelp('STRING')
     AddTextComponentSubstringPlayerName(text)
@@ -350,7 +421,12 @@ local function calibrate()
     if calibrating then return end
     calibrating = true
 
-    local backup = { x = Tune.x, y = Tune.y, scale = Tune.scale, stretch = Tune.stretch }
+    do -- make sure we start from the calibration of the current aspect ratio
+        local resX, resY = GetActiveScreenResolution()
+        if resX > 0 and resY > 0 then selectTune(resX, resY) end
+    end
+
+    local backup = copyTune(Tune)
     local dirty = false
 
     while calibrating do
@@ -360,11 +436,14 @@ local function calibrate()
         if IsControlPressed(0, 21) then step = 0.004 end  -- Shift
         if IsControlPressed(0, 36) then step = 0.0001 end -- Ctrl
 
+        -- Arrow keys move in ring-diameter units (~1px per tap at the default step).
+        local move = step / RING.diameter
+
         local moved = false
-        if IsControlPressed(0, 174) then Tune.x = Tune.x - step; moved = true end  -- left
-        if IsControlPressed(0, 175) then Tune.x = Tune.x + step; moved = true end  -- right
-        if IsControlPressed(0, 172) then Tune.y = Tune.y - step; moved = true end  -- up
-        if IsControlPressed(0, 173) then Tune.y = Tune.y + step; moved = true end  -- down
+        if IsControlPressed(0, 174) then Tune.x = Tune.x - move; moved = true end  -- left
+        if IsControlPressed(0, 175) then Tune.x = Tune.x + move; moved = true end  -- right
+        if IsControlPressed(0, 172) then Tune.y = Tune.y - move; moved = true end  -- up
+        if IsControlPressed(0, 173) then Tune.y = Tune.y + move; moved = true end  -- down
         if IsControlPressed(0, 10) then Tune.scale = Tune.scale + (step * 2); moved = true end                 -- PgUp
         if IsControlPressed(0, 11) then Tune.scale = math.max(0.2, Tune.scale - (step * 2)); moved = true end -- PgDn
         if IsControlPressed(0, 38) then Tune.stretch = Tune.stretch + (step * 2); moved = true end             -- E
@@ -379,13 +458,14 @@ local function calibrate()
 
         local resX, resY = GetActiveScreenResolution()
         showHelp(('~b~Minimap calibration~s~~n~Arrows: move  |  PgUp/PgDn: size  |  Q/E: narrower/wider~n~Enter: save  |  Backspace: cancel~n~'
-            .. 'x=%.4f  y=%.4f  scale=%.3f  stretch=%.3f~n~%dx%d  safezone=%.2f')
-            :format(Tune.x, Tune.y, Tune.scale, Tune.stretch, resX, resY, GetSafeZoneSize()))
+            .. 'x=%.4f  y=%.4f  scale=%.3f  stretch=%.3f~n~%dx%d (aspect %s)  safezone=%.2f~n~Saved for every resolution with this aspect ratio')
+            :format(Tune.x, Tune.y, Tune.scale, Tune.stretch, resX, resY, currentKey or '?', GetSafeZoneSize()))
 
         if IsControlJustPressed(0, 191) then -- Enter
-            saveTune()
-            print(('[codera-hud] minimap saved: x=%.4f y=%.4f scale=%.3f stretch=%.3f (%dx%d)')
-                :format(Tune.x, Tune.y, Tune.scale, Tune.stretch, resX, resY))
+            Saved[currentKey] = copyTune(Tune)
+            persistSaved()
+            print(('[codera-hud] minimap saved for aspect %s: x=%.4f y=%.4f scale=%.3f stretch=%.3f (%dx%d)')
+                :format(currentKey, Tune.x, Tune.y, Tune.scale, Tune.stretch, resX, resY))
             calibrating = false
         elseif IsControlJustPressed(0, 177) then -- Backspace
             Tune.x, Tune.y, Tune.scale, Tune.stretch = backup.x, backup.y, backup.scale, backup.stretch
@@ -399,9 +479,11 @@ RegisterCommand('vhudmap', function(_, args)
     if args[1] == 'debug' then
         CreateThread(function()
             local resX, resY = GetActiveScreenResolution()
+            local key, isSaved = selectTune(resX, resY)
             local ax, ay, bx, by = getAlignment(resX, resY)
-            local text = ('res=%dx%d  aspect=%.4f  nativeAspect=%.4f~n~safezone=%.3f~n~align ax=%.4f ay=%.4f bx=%.4f by=%.4f~n~tune x=%.4f y=%.4f scale=%.3f stretch=%.3f')
-                :format(resX, resY, resX / resY, GetAspectRatio(false), GetSafeZoneSize(), ax, ay, bx, by,
+            local text = ('res=%dx%d  aspect=%.4f (key %s, %s)  nativeAspect=%.4f~n~safezone=%.3f~n~align ax=%.4f ay=%.4f bx=%.4f by=%.4f~n~tune x=%.4f y=%.4f scale=%.3f stretch=%.3f')
+                :format(resX, resY, resX / resY, key, isSaved and 'saved' or 'auto default', GetAspectRatio(false),
+                    GetSafeZoneSize(), ax, ay, bx, by,
                     Tune.x, Tune.y, Tune.scale, Tune.stretch)
             print('[codera-hud] ' .. text:gsub('~n~', ' | '))
 
@@ -415,8 +497,11 @@ RegisterCommand('vhudmap', function(_, args)
     end
 
     if args[1] == 'reset' then
-        resetTune()
-        DeleteResourceKvp(KVP_KEY)
+        -- Drops every manual calibration -> back to the automatic default everywhere.
+        Saved = {}
+        persistSaved()
+        local resX, resY = GetActiveScreenResolution()
+        if resX > 0 and resY > 0 then selectTune(resX, resY) end
         applyMinimap()
         return
     end
